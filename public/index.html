@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>OcMedGraph</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; display: flex; height: 100vh; overflow: hidden; }
+    #sidebar { width: 250px; border-right: 1px solid #ccc; padding: 10px; box-sizing: border-box; background: #f9f9f9; overflow-y: auto; }
+    #graph { flex: 1; position: relative; }
+    svg { width: 100%; height: 100vh; background-color: #f0f0f0; cursor: grab; user-select: none; }
+    input[type="text"] { width: calc(100% - 50px); padding: 5px; margin-bottom: 10px; box-sizing: border-box; }
+    button { padding: 5px 10px; margin-left: 5px; cursor: pointer; user-select: none; }
+    #labelButtons button { width: 100%; margin-bottom: 0; background: white; border: 1px solid #ccc; text-align: left; cursor: pointer; padding: 6px 10px; user-select: none; }
+    .label-container { margin-bottom: 10px; }
+    .nodeListContainer {
+      max-height: 150px; overflow-y: auto; border: 1px solid #ccc; margin-top: 3px; padding: 5px; background: #fff; display: none;
+    }
+    .nodeListContainer button { width: 100%; margin-bottom: 5px; background: #f5f5f5; border: 1px solid #ddd; text-align: left; cursor: pointer; padding: 4px 8px; user-select: none; }
+
+    /* 修改后的 legend 样式 */
+    #legend {
+      position: absolute;
+      bottom: 15px;
+      right: 15px;
+      background: rgba(255,255,255,0.85);
+      border: 1px solid #ccc;
+      padding: 8px 12px;
+      font-size: 11px;
+      box-shadow: 0 0 6px rgba(0,0,0,0.1);
+      user-select: none;
+      z-index: 10;
+      max-width: 240px;
+      border-radius: 4px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;  /* 垂直间距 */
+      word-break: break-word;
+    }
+    #legend div {
+      display: flex;
+      align-items: center;
+      white-space: normal;
+    }
+    #legend div span.color-box {
+      width: 18px;
+      height: 18px;
+      margin-right: 8px;
+      border-radius: 3px;
+      border: 1px solid #aaa;
+      flex-shrink: 0;
+    }
+
+    svg text.edge-label {
+      font-size: 10px;
+      fill: #555;
+      pointer-events: none;
+      user-select: none;
+    }
+    
+    /* 节点文字样式 */
+    .node-text tspan {
+      font-size: 12px;
+      fill: #000;
+      font-weight: normal;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h3>Node Search</h3>
+    <input type="text" id="searchInput" placeholder="Enter keyword to search node" />
+    <button id="searchBtn">Search</button>
+    <h3>Label Directory</h3>
+    <div id="labelButtons"></div>
+    <div style="margin-top: 20px;">
+      <button id="clearBtn" style="background:#f44336; color:white;">Clear Graph</button>
+      <button id="showFullGraphBtn" style="margin-top:10px; background:#4CAF50; color:white;">Show Full Graph</button>
+    </div>
+  </div>
+  <div id="graph">
+    <svg></svg>
+    <div id="legend"></div>
+  </div>
+
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script>
+    const colorMap = {
+      "First":      { color: "#EF5350", text: "Primary fundus disease" },
+      "Second":     { color: "#FFA726", text: "Secondary fundus disease" },
+      "Third":      { color: "#FFEB3B", text: "Tertiary fundus disease" },
+      "Forth":      { color: "#FFF8DC", text: "Forth fundus disease" },
+      "Physical_sign":   { color: "#81C784", text: "Physical sign" },
+      "Treatment":       { color: "#4DB6AC", text: "Treatment" },
+      "OCT_sign":        { color: "#42A5F5", text: "OCT sign" },
+      "Symptom":         { color: "#BA68C8", text: "Symptom" },
+      "Etiology":        { color: "#F48FB1", text: "Etiology" },
+      "Differential_diagnosis": { color: "#795548", text: "Differential diagnosis" },
+      "Complication":    { color: "#FF8A65", text: "Complication" },
+      "Gene":    { color: "#A1887F", text: "Gene" },
+      "Related_disease":    { color: "#8AC1D1", text: "Related disease" },
+      "Synonym_3":       { color: "#9FA8DA", text: "Synonym 3" },
+      "Synonym_4":       { color: "#9FA8DA", text: "Synonym 4" }
+    };
+
+    let firstCategoryClick = true;
+    let allNodes = []; // Store all nodes for client-side search
+    let allEdges = []; // Store all edges for relationship search
+
+    function getColorForLabel(label, labels) {
+      if (!label) return "#999";
+      if (colorMap[label]) return colorMap[label].color;
+      const idx = labels.indexOf(label);
+      return idx >= 0 ? Object.values(colorMap)[idx]?.color || "#999" : "#999";
+    }
+
+    const width = window.innerWidth - 250, height = window.innerHeight;
+    const svg = d3.select("svg").attr("width", width).attr("height", height);
+    const container = svg.append("g");
+
+    svg.call(d3.zoom().scaleExtent([0.1,4]).on("zoom", e => container.attr("transform", e.transform)));
+
+    const simulation = d3.forceSimulation()
+      .force("link", d3.forceLink().id(d=>d.id).distance(150))
+      .force("charge", d3.forceManyBody().strength(-500))
+      .force("center", d3.forceCenter(width/2, height/2))
+      .force("collide", d3.forceCollide().radius(50))
+      .alphaDecay(0.03);
+
+    let graphData = { nodes: [], links: [] }, nodesMap = new Map(), labels = [];
+
+    async function fetchLabels() {
+      const res = await fetch("/api/graph/labels"); 
+      let fetchedLabels = await res.json();
+
+      // Process labels to handle duplicates (prefer versions with underscore)
+      const labelMap = {};
+      fetchedLabels.forEach(label => {
+        const normalized = label.replace(/_/g, ' ');
+        if (!labelMap[normalized] || label.includes('_')) {
+          labelMap[normalized] = label;
+        }
+      });
+      fetchedLabels = Object.values(labelMap);
+
+      // 合并 colorMap 里的所有类别，确保图例完整
+      let allLabels = Array.from(new Set([...Object.keys(colorMap), ...fetchedLabels]));
+
+      // First 放最前
+      const orderedLabels = [];
+      if(allLabels.includes("First")) orderedLabels.push("First");
+      allLabels.forEach(k => {
+        if(k !== "First") orderedLabels.push(k);
+      });
+      labels = orderedLabels;
+
+      renderLabelButtons(labels); 
+      renderLegend(labels);
+    }
+
+    function renderLabelButtons(labels) {
+      const containerLB = d3.select("#labelButtons").html("");
+      labels.forEach(label => {
+        const displayLabel = label.replace(/_/g, ' ');
+        const ct = containerLB.append("div").attr("class","label-container");
+        ct.append("button").text(displayLabel).on("click", () => toggleLabelList(ct, label));
+        ct.append("div").attr("class","nodeListContainer").attr("data-label", label);
+      });
+    }
+
+    function renderLegend(labels) {
+      const legend = d3.select("#legend").html("");
+      labels.forEach(label => {
+        const displayLabel = label.replace(/_/g, ' ');
+        const info = colorMap[label] || {color: getColorForLabel(label, labels), text: displayLabel};
+        const item = legend.append("div");
+        item.append("span")
+            .attr("class","color-box")
+            .style("background-color", info.color);
+        item.append("span").text(info.text);
+      });
+    }
+
+    async function toggleLabelList(ct, label) {
+      const listDiv = ct.select(`.nodeListContainer[data-label='${label}']`);
+      const isVisible = listDiv.style("display") === "block";
+      if (isVisible) { listDiv.style("display","none"); return; }
+      if (firstCategoryClick) { clearGraph(); firstCategoryClick = false; }
+      const res = await fetch(`/api/graph/nodesByLabel/${encodeURIComponent(label)}`);
+      let nodes = await res.json();
+      nodes.sort((a,b)=> (a.properties.name||"").toLowerCase().localeCompare((b.properties.name||"").toLowerCase()));
+      renderNodeList(nodes, listDiv);
+      listDiv.style("display","block");
+    }
+
+    function renderNodeList(nodes, listDiv) {
+      listDiv.html("");
+      nodes.forEach(node => {
+        listDiv.append("button").text(node.properties.name || node.id)
+          .on("click", async()=> await expandNode(node.id));
+      });
+    }
+
+    function clearGraph() {
+      nodesMap.clear(); graphData = {nodes:[], links:[]}; updateGraph();
+    }
+
+    document.getElementById("clearBtn").addEventListener("click", clearGraph);
+
+    async function loadFullGraph() {
+      const res = await fetch("/api/graph/full");
+      const data = await res.json();
+      nodesMap.clear();
+      graphData = {nodes: [], links: []};
+      allNodes = data.nodes; // Store all nodes for client-side search
+      allEdges = data.edges; // Store all edges for relationship search
+      mergeGraphData(data.nodes, data.edges);
+      updateGraph();
+    }
+
+    document.getElementById("showFullGraphBtn").addEventListener("click", loadFullGraph);
+
+    function updateGraph() {
+      container.selectAll("*").remove();
+
+      const link = container.append("g").attr("stroke","#aaa").attr("stroke-width",1.5)
+        .selectAll("line").data(graphData.links).join("line");
+
+      const edgeLabels = container.append("g").selectAll("text").data(graphData.links).join("text")
+        .attr("class","edge-label").attr("text-anchor","middle").attr("dy",-3).text(d=>d.label||"");
+
+      const nodeGroup = container.append("g").selectAll("g").data(graphData.nodes).join("g")
+        .attr("cursor","pointer")
+        .on("click",(e,d)=>expandNode(d.id))
+        .call(d3.drag().on("start",dragstarted).on("drag",dragged).on("end",dragended));
+
+      nodeGroup.append("circle").attr("r",35)
+        .attr("fill", d=>getColorForLabel(d.labels?.[0],labels))
+        .attr("stroke","#fff").attr("stroke-width",1.5);
+
+      // ========== 修改的节点文字显示部分 ==========
+      nodeGroup.each(function(d) {
+        const node = d3.select(this);
+        const text = node.append("text")
+          .attr("class", "node-text")
+          .attr("text-anchor", "middle")
+          .attr("dy", "0.35em");
+        
+        const name = d.properties.name || d.id;
+        const maxCharsPerLine = 10; // 每行最大字符数
+        const words = name.split(/(?=[A-Z][a-z])|\s+|_|-/); // 按大写字母、空格、下划线、连字符分割
+        
+        let currentLine = [];
+        let currentLineLength = 0;
+        let lineNumber = 0;
+        
+        words.forEach(word => {
+          if (currentLineLength + word.length > maxCharsPerLine && currentLine.length > 0) {
+            // 当前行已满，添加新行
+            text.append("tspan")
+              .attr("x", 0)
+              .attr("dy", lineNumber === 0 ? "0" : "1.2em")
+              .text(currentLine.join(' '));
+            currentLine = [word];
+            currentLineLength = word.length;
+            lineNumber++;
+          } else {
+            currentLine.push(word);
+            currentLineLength += word.length + (currentLine.length > 0 ? 1 : 0); // 加空格长度
+          }
+        });
+        
+        // 添加最后一行
+        if (currentLine.length > 0) {
+          text.append("tspan")
+            .attr("x", 0)
+            .attr("dy", lineNumber === 0 ? "0" : "1.2em")
+            .text(currentLine.join(' '));
+        }
+        
+        // 垂直居中调整
+        text.attr("transform", `translate(0,${-lineNumber*6})`);
+      });
+      // ========== 修改结束 ==========
+
+      simulation.nodes(graphData.nodes).on("tick",()=>{
+        link.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y).attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
+        edgeLabels.attr("x",d=>(d.source.x+d.target.x)/2).attr("y",d=>(d.source.y+d.target.y)/2);
+        nodeGroup.attr("transform",d=>`translate(${d.x},${d.y})`);
+      });
+
+      simulation.force("link").links(graphData.links);
+      simulation.alpha(1).restart();
+
+      nodeGroup.on("mouseover",(e,d)=>{
+        nodeGroup.style("opacity",o=>areNeighbors(d,o)?1:0.1);
+        link.style("opacity",l=>l.source.id===d.id||l.target.id===d.id?1:0.1);
+        edgeLabels.style("opacity",l=>l.source.id===d.id||l.target.id===d.id?1:0.1);
+      }).on("mouseout",()=>{
+        nodeGroup.style("opacity",1); link.style("opacity",1); edgeLabels.style("opacity",1);
+      });
+    }
+
+    function areNeighbors(a,b) {
+      return graphData.links.some(l=>(l.source.id===a.id&&l.target.id===b.id)||(l.target.id===a.id&&l.source.id===b.id))||a.id===b.id;
+    }
+
+    function mergeGraphData(newNodes,newLinks) {
+      newNodes.forEach(n=>{ if(!nodesMap.has(n.id)) nodesMap.set(n.id,n); });
+      graphData.nodes = Array.from(nodesMap.values());
+      const edgeSet=new Set(graphData.links.map(l=>`${l.source.id}-${l.target.id}`));
+      newLinks.forEach(l=>{const key=`${l.from}-${l.to}`; if(!edgeSet.has(key)) graphData.links.push({source:l.from,target:l.to,label:l.label});});
+    }
+
+    async function loadInitialGraph(){
+      const res=await fetch("/api/graph/initial"), data=await res.json();
+      nodesMap.clear(); graphData={nodes:[],links:[]}; 
+      allNodes = data.nodes; // Store all nodes for client-side search
+      allEdges = data.edges; // Store all edges for relationship search
+      
+      // Only show about 20 nodes initially
+      const sampleNodes = data.nodes.slice(0, 20);
+      const sampleEdges = data.edges.filter(edge => 
+        sampleNodes.some(n => n.id === edge.from) && sampleNodes.some(n => n.id === edge.to)
+      );
+      
+      mergeGraphData(sampleNodes, sampleEdges); 
+      updateGraph();
+    }
+
+    // 简化搜索函数，匹配包含关键词的节点
+    function searchNodes(query, nodes) {
+      query = query.toLowerCase().trim();
+      if (!query) return [];
+
+      return nodes.filter(node => {
+        const name = (node.properties.name || node.id).toLowerCase();
+        return name.includes(query);
+      });
+    }
+
+    // 改进后的搜索函数，清空旧图，只显示匹配节点及它们相关边，自动居中第一个匹配节点
+    async function searchGraph(q){
+      if(!q) return;
+
+      // 先在当前图谱节点里搜索
+      let results = searchNodes(q, graphData.nodes);
+
+      // 当前图无匹配，去所有节点里搜索
+      if (results.length === 0) {
+        results = searchNodes(q, allNodes);
+      }
+
+      if (results.length > 0) {
+        clearGraph();
+
+        const resultIds = new Set(results.map(n => n.id));
+
+        // 找匹配节点间的边
+        const connectedEdges = allEdges.filter(edge =>
+          resultIds.has(edge.from) && resultIds.has(edge.to)
+        );
+
+        mergeGraphData(results, connectedEdges);
+        updateGraph();
+
+        // 仿真结束后自动居中第一个匹配节点
+        simulation.on("end", () => {
+          if (graphData.nodes.length === 0) return;
+          const firstNode = graphData.nodes[0];
+          if (firstNode.x !== undefined && firstNode.y !== undefined) {
+            const transform = d3.zoomIdentity.translate(width/2 - firstNode.x, height/2 - firstNode.y);
+            svg.transition().duration(750).call(
+              d3.zoom().transform,
+              transform
+            );
+          }
+        });
+      } else {
+        alert("No matching nodes found. Try a different search term.");
+      }
+    }
+
+    // 点击节点展开邻居节点并更新图谱
+    async function expandNode(nodeId){
+      // 查找nodeId在allNodes中对应节点
+      const node = allNodes.find(n=>n.id===nodeId);
+      if(!node) {
+        alert("Node data not found.");
+        return;
+      }
+
+      // 查找所有相关边
+      const relatedEdges = allEdges.filter(edge => edge.from === nodeId || edge.to === nodeId);
+
+      // 查找相关邻居节点
+      const neighborIds = new Set();
+      relatedEdges.forEach(e => {neighborIds.add(e.from); neighborIds.add(e.to);});
+      const neighbors = allNodes.filter(n => neighborIds.has(n.id));
+
+      // 添加当前节点和邻居节点及边到图
+      mergeGraphData([node, ...neighbors], relatedEdges);
+      updateGraph();
+    }
+
+    function dragstarted(event, d) {
+      if (!event.active) simulation.alphaTarget(0.3).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    }
+
+    function dragged(event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+    }
+
+    function dragended(event, d) {
+      if (!event.active) simulation.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+    }
+
+    // 绑定搜索按钮及回车事件
+    document.getElementById("searchBtn").addEventListener("click", () => {
+      const q = document.getElementById("searchInput").value;
+      searchGraph(q);
+    });
+
+    document.getElementById("searchInput").addEventListener("keydown", e => {
+      if(e.key === "Enter"){
+        searchGraph(e.target.value);
+      }
+    });
+
+    // 初始化
+    fetchLabels();
+    loadInitialGraph();
+
+  </script>
+</body>
+</html>
